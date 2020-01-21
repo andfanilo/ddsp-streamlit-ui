@@ -1,6 +1,8 @@
 # DDSP demo on Streamlit
 
-Streamlit version for the [DDSP timbre transfer demo](https://github.com/magenta/ddsp/blob/master/ddsp/colab/demos/timbre_transfer.ipynb).
+Streamlit version for the [DDSP timbre transfer demo](https://github.com/magenta/ddsp/blob/master/ddsp/colab/demos/timbre_transfer.ipynb) _but only for `.wav` files_.
+
+![](./demo.png)
 
 ## Prerequisites
 
@@ -34,6 +36,8 @@ The structure should look like :
 - You also need some `.wav` file to upload. There is no means to record your voice yet within Streamlit so do it beforehand, or download some free voice sample.
 
 ## Install
+
+I use conda but feel free to use your own virtual env to install requirements.txt :
 
 ```bash
 conda create -n ddsp-streamlit-ui python=3.7

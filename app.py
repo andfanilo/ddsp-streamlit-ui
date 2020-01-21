@@ -28,13 +28,19 @@ import soundfile as sf
 import streamlit as st
 import tensorflow.compat.v1 as tf
 
+tf.compat.v1.disable_v2_behavior()
+
 ########################################################################
-# Initializing things
+# Parameters
 ########################################################################
 
-tf.compat.v1.disable_v2_behavior()
-TARGET = ""
-CKPT_DIR = "models"
+CKPT_DIR = "./models"
+TF_TARGET = ""
+TITLE_LABEL = "DDSP Timbre Transfer demo"
+UPLOAD_FILE_LABEL = "Choose a .wav file"
+BUTTON_LABEL = "Compute timbre transfer"
+GENERATE_AUDIO_LABEL = "Generating audio..."
+EXPORTED_FILE_LABEL = "File has been exported to `output.wav`"
 
 ########################################################################
 # Helper methods
@@ -49,7 +55,7 @@ def reset_crepe():
 
 @st.cache
 def load_audio(wav_data):
-    """Load audio into numpy array, cache it with Streamlit"""
+    """Load audio into numpy array, cache it so on reload script music doesn't need to reload"""
     # TODO : should detect format to pass sample rate when enabling mp3, 16000 for mp3
     audio_np, unused_sr = librosa.core.load(uploaded_file, sr=44100)
     return audio_np, unused_sr
@@ -57,34 +63,57 @@ def load_audio(wav_data):
 
 @st.cache
 def compute_audio_features(audio_np):
-    """Compute audio features, cache it with Streamlit"""
+    """Compute audio features, cache it because it's a long computation"""
     audio_features = ddsp.training.eval_util.compute_audio_features(audio_np)
-    audio_features_mod = None
-    return audio_features, audio_features_mod
+    return audio_features
 
 
-def specplot(
-    audio_np, vmin=-5, vmax=1, rotate=True, size=512 + 256, sess=None, **matshow_kwargs
+def compute_adjusted_features(
+    audio_features,
+    auto_adjust,
+    loudness_db_shift,
+    f0_octave_shift,
+    f0_confidence_threshold,
 ):
-    """Plot the log magnitude spectrogram of audio_np."""
-    # If batched, take first element.
-    if len(audio_np.shape) == 2:
-        audio_np = audio_np[0]
+    """Compute resynthetized audio"""
+    audio_features_mod = {k: v.copy() for k, v in audio_features.items()}
+    if auto_adjust:
+        # Adjust the peak loudness.
+        l = audio_features["loudness_db"]
+        model_ld_avg_max = {"Violin": -34.0, "Flute": -45.0, "Flute2": -44.0,}[
+            instrument_model
+        ]
+        ld_max = np.max(audio_features["loudness_db"])
+        ld_diff_max = model_ld_avg_max - ld_max
+        audio_features_mod = shift_ld(audio_features_mod, ld_diff_max)
 
-    logmag = ddsp.spectral_ops.compute_logmag(ddsp.core.tf_float32(audio_np), size=size)
-    if sess is not None:
-        logmag = sess.run(logmag)
+        # Further adjust the average loudness above a threshold.
+        l = audio_features_mod["loudness_db"]
+        model_ld_mean = {"Violin": -44.0, "Flute": -51.0, "Flute2": -53.0,}[
+            instrument_model
+        ]
+        ld_thresh = -50.0
+        ld_mean = np.mean(l[l > ld_thresh])
+        ld_diff_mean = model_ld_mean - ld_mean
+        audio_features_mod = shift_ld(audio_features_mod, ld_diff_mean)
 
-    if rotate:
-        logmag = np.rot90(logmag)
-    # Plotting.
-    plt.matshow(
-        logmag, vmin=vmin, vmax=vmax, cmap=plt.cm.magma, aspect="auto", **matshow_kwargs
-    )
-    plt.xticks([])
-    plt.yticks([])
-    plt.xlabel("Time")
-    plt.ylabel("Frequency")
+        # Shift the pitch register.
+        model_p_mean = {"Violin": 73.0, "Flute": 81.0, "Flute2": 74.0,}[
+            instrument_model
+        ]
+        p = librosa.hz_to_midi(audio_features["f0_hz"])
+        p[p == -np.inf] = 0.0
+        p_mean = p[l > ld_thresh].mean()
+        p_diff = model_p_mean - p_mean
+        p_diff_octave = p_diff / 12.0
+        round_fn = np.floor if p_diff_octave > 1.5 else np.ceil
+        p_diff_octave = round_fn(p_diff_octave)
+        audio_features_mod = shift_f0(audio_features_mod, p_diff_octave)
+
+    audio_features_mod = shift_ld(audio_features_mod, loudness_db_shift)
+    audio_features_mod = shift_f0(audio_features_mod, f0_octave_shift)
+    audio_features_mod = mask_by_confidence(audio_features_mod, f0_confidence_threshold)
+    return audio_features_mod
 
 
 def shift_ld(audio_features, ld_shift=0.0):
@@ -121,14 +150,94 @@ def smooth_loudness(audio_features, filter_size=3):
     return audio_features
 
 
-########################################################################
-# Parameters
-########################################################################
+@st.cache
+def load_model(instrument_model, audio_length):
+    # Build checkpoint path
+    # Assumes only one checkpoint in the folder, 'model.ckpt-[iter]`.
+    model_dir = os.path.join(CKPT_DIR, "solo_%s_ckpt" % instrument_model.lower())
+    ckpt_files = [f for f in tf.gfile.ListDirectory(model_dir) if "model.ckpt" in f]
+    ckpt_name = ".".join(ckpt_files[0].split(".")[:2])
+    ckpt = os.path.join(model_dir, ckpt_name)
 
-CKPT_DIR = "./models"
-TITLE_LABEL = "DDSP Timbre Transfer demo"
-UPLOAD_FILE_LABEL = "Choose a .wav file"
-BUTTON_LABEL = "Compute transfer (can take a while on CPU)"
+    # Parse gin config
+    with gin.unlock_config():
+        gin_file = os.path.join(model_dir, "operative_config-0.gin")
+        gin.parse_config_file(gin_file, skip_unknown=True)
+
+    # Ensure dimensions sampling rates are equal
+    time_steps_train = gin.query_parameter("DefaultPreprocessor.time_steps")
+    n_samples_train = gin.query_parameter("Additive.n_samples")
+    hop_size = int(n_samples_train / time_steps_train)
+
+    time_steps = int(audio_length / hop_size)
+    n_samples = time_steps * hop_size
+
+    gin_params = [
+        "Additive.n_samples = {}".format(n_samples),
+        "FilteredNoise.n_samples = {}".format(n_samples),
+        "DefaultPreprocessor.time_steps = {}".format(time_steps),
+    ]
+
+    with gin.unlock_config():
+        gin.parse_config(gin_params)
+
+    return ckpt, time_steps, n_samples
+
+
+def trim_audio(audio_features, n_samples, time_steps):
+    """Trim all input vectors to correct lengths"""
+    for key in ["f0_hz", "f0_confidence", "loudness_db"]:
+        audio_features[key] = audio_features[key][:time_steps]
+    audio_features["audio"] = audio_features["audio"][:n_samples]
+    return audio_features
+
+
+def plot_audio(audio_features, audio_features_mod, **kwargs):
+    """Plot audio features in matplotlib"""
+    legend = ["Audio features", "Resynth audio"]
+    fig, ax = plt.subplots(nrows=3, ncols=1, sharex=True, figsize=(6, 4))
+    ax[0].plot(audio_features["loudness_db"])
+    ax[0].plot(audio_features_mod["loudness_db"])
+    ax[0].set_ylabel("loudness_db")
+    ax[0].legend(legend)
+
+    ax[1].plot(librosa.hz_to_midi(audio_features["f0_hz"]))
+    ax[1].plot(librosa.hz_to_midi(audio_features_mod["f0_hz"]))
+    ax[1].set_ylabel("f0 [midi]")
+    ax[1].legend(legend)
+
+    ax[2].plot(audio_features_mod["f0_confidence"])
+    ax[2].plot(
+        np.ones_like(audio_features_mod["f0_confidence"]) * f0_confidence_threshold
+    )
+    ax[2].set_ylabel("f0 confidence")
+    ax[2].set_xlabel("Time step [frame]")
+    ax[2].legend(legend)
+    return fig, ax
+
+
+def specplot(audio_np, vmin=-5, vmax=1, rotate=True, size=512 + 256, sess=None, **matshow_kwargs):
+    """Plot the log magnitude spectrogram of audio."""
+    # If batched, take first element.
+    if len(audio_np.shape) == 2:
+        audio_np = audio_np[0]
+
+    logmag = ddsp.spectral_ops.compute_logmag(ddsp.core.tf_float32(audio_np), size=size)
+    if sess is not None:
+        logmag = sess.run(logmag)
+
+    if rotate:
+        logmag = np.rot90(logmag)
+
+    # Plotting.
+    plt.matshow(
+        logmag, vmin=vmin, vmax=vmax, cmap=plt.cm.magma, aspect="auto", **matshow_kwargs
+    )
+    plt.xticks([])
+    plt.yticks([])
+    plt.xlabel("Time")
+    plt.ylabel("Frequency")
+
 
 ########################################################################
 # UI
@@ -139,7 +248,7 @@ instrument_model = st.sidebar.selectbox("Choose a model", ("Violin", "Flute", "F
 
 
 st.sidebar.markdown(
-    "This button will at least adjusts the average loudness and pitch to be similar to the training data (although not for user trained models)."
+    "This button will at least adjust the average loudness and pitch to be similar to the training data (although not for user trained models)."
 )
 
 
@@ -155,11 +264,15 @@ You can also make additional manual adjustments:
 """
 )
 
-f0_octave_shift = st.sidebar.slider("f0_octave_shift", min_value=-2, max_value=2, value=0, step=1)
-f0_confidence_threshold = st.sidebar.slider(
-    "f0_confidence_threshold",  min_value=0.0, max_value=1.0, value=0.0, step=0.05
+f0_octave_shift = st.sidebar.slider(
+    "f0_octave_shift", min_value=-2, max_value=2, value=0, step=1
 )
-loudness_db_shift = st.sidebar.slider("loudness_db_shift", min_value=-20, max_value=20, value=0, step=1)
+f0_confidence_threshold = st.sidebar.slider(
+    "f0_confidence_threshold", min_value=0.0, max_value=1.0, value=0.0, step=0.05
+)
+loudness_db_shift = st.sidebar.slider(
+    "loudness_db_shift", min_value=-20, max_value=20, value=0, step=1
+)
 
 ########################### Main panel
 
@@ -167,62 +280,19 @@ st.title(TITLE_LABEL)
 
 uploaded_file = st.file_uploader(UPLOAD_FILE_LABEL, type=["wav"])
 if uploaded_file is not None:
-    st.audio(uploaded_file)
     audio_np, unused_sr = load_audio(uploaded_file)
+    audio_features = compute_audio_features(audio_np)
+    audio_features_mod = None
+    st.audio(uploaded_file)
 
     if st.button(BUTTON_LABEL):
         tf.reset_default_graph()
-        sess = tf.Session(TARGET)
+        sess = tf.Session(TF_TARGET)
         tf.keras.backend.set_session(sess)
         reset_crepe()
 
-        audio_features, audio_features_mod = compute_audio_features(audio_np)
-
-        fig, ax = plt.subplots(nrows=3, ncols=1, sharex=True, figsize=(6, 8))
-        ax[0].plot(audio_features["loudness_db"])
-        ax[0].set_ylabel("loudness_db")
-
-        ax[1].plot(librosa.hz_to_midi(audio_features["f0_hz"]))
-        ax[1].set_ylabel("f0 [midi]")
-
-        ax[2].plot(audio_features["f0_confidence"])
-        ax[2].set_ylabel("f0 confidence")
-        _ = ax[2].set_xlabel("Time step [frame]")
-
-        st.pyplot()
-
-        # Load chosen model, cache it too ?
-        model_dir = os.path.join(CKPT_DIR, "solo_%s_ckpt" % instrument_model.lower())
-        ckpt_files = [f for f in tf.gfile.ListDirectory(model_dir) if "model.ckpt" in f]
-        ckpt_name = ".".join(ckpt_files[0].split(".")[:2])
-        ckpt = os.path.join(model_dir, ckpt_name)
-
-        # Parse gin config
-        with gin.unlock_config():
-            gin_file = os.path.join(model_dir, "operative_config-0.gin")
-            gin.parse_config_file(gin_file, skip_unknown=True)
-
-        # Ensure dimensions sampling rates are equal
-        time_steps_train = gin.query_parameter("DefaultPreprocessor.time_steps")
-        n_samples_train = gin.query_parameter("Additive.n_samples")
-        hop_size = int(n_samples_train / time_steps_train)
-
-        time_steps = int(audio_np.shape[0] / hop_size)
-        n_samples = time_steps * hop_size
-
-        gin_params = [
-            "Additive.n_samples = {}".format(n_samples),
-            "FilteredNoise.n_samples = {}".format(n_samples),
-            "DefaultPreprocessor.time_steps = {}".format(time_steps),
-        ]
-
-        with gin.unlock_config():
-            gin.parse_config(gin_params)
-
-        # Trim all input vectors to correct lengths
-        for key in ["f0_hz", "f0_confidence", "loudness_db"]:
-            audio_features[key] = audio_features[key][:time_steps]
-        audio_features["audio"] = audio_features["audio"][:n_samples]
+        ckpt, time_steps, n_samples = load_model(instrument_model, audio_np.shape[0])
+        audio_features = trim_audio(audio_features, n_samples, time_steps)
 
         # Set up the model just to predict audio given new conditioning
         tf.reset_default_graph()
@@ -239,68 +309,17 @@ if uploaded_file is not None:
         model = ddsp.training.models.Autoencoder()
         predictions = model.get_outputs(ph_features, training=False)
 
-        sess = tf.Session(TARGET)
-
+        sess = tf.Session(TF_TARGET)
         model.restore(sess, ckpt)
 
-        # Resynth audio
-        audio_features_mod = {k: v.copy() for k, v in audio_features.items()}
-        if auto_adjust:
-            # Adjust the peak loudness.
-            l = audio_features["loudness_db"]
-            model_ld_avg_max = {"Violin": -34.0, "Flute": -45.0, "Flute2": -44.0,}[
-                instrument_model
-            ]
-            ld_max = np.max(audio_features["loudness_db"])
-            ld_diff_max = model_ld_avg_max - ld_max
-            audio_features_mod = shift_ld(audio_features_mod, ld_diff_max)
-
-            # Further adjust the average loudness above a threshold.
-            l = audio_features_mod["loudness_db"]
-            model_ld_mean = {"Violin": -44.0, "Flute": -51.0, "Flute2": -53.0,}[
-                instrument_model
-            ]
-            ld_thresh = -50.0
-            ld_mean = np.mean(l[l > ld_thresh])
-            ld_diff_mean = model_ld_mean - ld_mean
-            audio_features_mod = shift_ld(audio_features_mod, ld_diff_mean)
-
-            # Shift the pitch register.
-            model_p_mean = {"Violin": 73.0, "Flute": 81.0, "Flute2": 74.0,}[
-                instrument_model
-            ]
-            p = librosa.hz_to_midi(audio_features["f0_hz"])
-            p[p == -np.inf] = 0.0
-            p_mean = p[l > ld_thresh].mean()
-            p_diff = model_p_mean - p_mean
-            p_diff_octave = p_diff / 12.0
-            round_fn = np.floor if p_diff_octave > 1.5 else np.ceil
-            p_diff_octave = round_fn(p_diff_octave)
-            audio_features_mod = shift_f0(audio_features_mod, p_diff_octave)
-
-        audio_features_mod = shift_ld(audio_features_mod, loudness_db_shift)
-        audio_features_mod = shift_f0(audio_features_mod, f0_octave_shift)
-        audio_features_mod = mask_by_confidence(
-            audio_features_mod, f0_confidence_threshold
+        audio_features_mod = compute_adjusted_features(
+            audio_features,
+            auto_adjust,
+            loudness_db_shift,
+            f0_octave_shift,
+            f0_confidence_threshold,
         )
-
-        fig, ax = plt.subplots(nrows=3, ncols=1, sharex=True, figsize=(6, 8))
-        ax[0].plot(audio_features["loudness_db"])
-        ax[0].plot(audio_features_mod["loudness_db"])
-        ax[0].set_ylabel("loudness_db")
-
-        ax[1].plot(librosa.hz_to_midi(audio_features["f0_hz"]))
-        ax[1].plot(librosa.hz_to_midi(audio_features_mod["f0_hz"]))
-        ax[1].set_ylabel("f0 [midi]")
-
-        ax[2].plot(audio_features_mod["f0_confidence"])
-        ax[2].plot(
-            np.ones_like(audio_features_mod["f0_confidence"]) * f0_confidence_threshold
-        )
-        ax[2].set_ylabel("f0 confidence")
-        _ = ax[2].set_xlabel("Time step [frame]")
-
-        st.pyplot()
+        
 
         af = audio_features if audio_features_mod is None else audio_features_mod
         feed_dict = {}
@@ -309,11 +328,18 @@ if uploaded_file is not None:
         ]
         feed_dict[ph_features["f0_hz"]] = af["f0_hz"][np.newaxis, :, np.newaxis]
         feed_dict[ph_features["audio"]] = af["audio"][np.newaxis, :]
-        audio_gen = sess.run(predictions["audio_gen"], feed_dict=feed_dict)[0]
 
-        st.write("Hello world")
+        audio_gen = None
+        with st.spinner(GENERATE_AUDIO_LABEL):
+            audio_gen = sess.run(predictions["audio_gen"], feed_dict=feed_dict)[0]
+
+        # Export
+        sf.write("output.wav", audio_gen, 44100)
+        st.markdown(EXPORTED_FILE_LABEL)
 
         # Plot results
+        fig, ax = plot_audio(audio_features, audio_features_mod)
+        st.pyplot(fig=fig)
         with tf.Session() as sess:
             specplot(audio_np, sess=sess)
             plt.title("Original")
@@ -321,6 +347,3 @@ if uploaded_file is not None:
             specplot(audio_gen, sess=sess)
             _ = plt.title("Resynthesis")
             st.pyplot()
-
-        # Export
-        sf.write("output.wav", audio_gen, 44100)
