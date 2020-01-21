@@ -92,7 +92,7 @@ pyparsing==2.4.6          # via matplotlib
 pyrsistent==0.15.7        # via jsonschema
 python-dateutil==2.8.0    # via botocore, jupyter-client, matplotlib, pandas, streamlit
 pytz==2019.3              # via pandas, tzlocal
-pywin32==227              # via jupyter-client, jupyter-core
+#pywin32==227              # via jupyter-client, jupyter-core
 pywinpty==0.5.7           # via terminado
 pyyaml==5.3               # via watchdog
 pyzmq==18.1.1             # via jupyter-client, notebook
